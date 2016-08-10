@@ -1,0 +1,218 @@
+"""
+AWS Elasticsearch Pressure Testing Script:
+1. This script periodically scales AWS Elasticsearch between the following two settings:
+
+Setting 1:
+-instance type: r3.xlarge.elasticsearch
+-instance count: 4
+-storage space: 500 GB
+-zone awareness: disabled
+-dedicated master: disabled
+
+Setting 2:
+-instance type: r3.xlarge.elasticsearch
+-instance count: 10
+-storage space: 500 GB
+-zone awareness: enabled
+-dedicated master: enabled
+-master instance type: m3.medium.elasticsearch
+-master instance count: 3
+
+2. It inserts/queries Elasticsearch cluster and make sure all queries returns valid results.
+3. It stops on queries where some of them returns valid results and some of them return empty results.
+   The script prints out the current cluster settings on such event.
+"""
+
+import boto3, time, threading, pprint
+client = boto3.client('es')
+domainName = 'cche-es'
+
+
+# Two configs
+ClusterConfig1 = {
+        'InstanceType': 'r3.xlarge.elasticsearch',
+        'InstanceCount': 4,
+        'DedicatedMasterEnabled': False,
+        'ZoneAwarenessEnabled': False
+    }
+
+ClusterConfig2 = {
+        'InstanceType': 'r3.xlarge.elasticsearch',
+        'InstanceCount': 10,
+        'DedicatedMasterEnabled': True,
+        'ZoneAwarenessEnabled': True,
+        'DedicatedMasterType': 'm3.medium.elasticsearch',
+        'DedicatedMasterCount': 3
+    }
+
+
+# Create elasticsearch domain with Setting 1
+
+
+response = client.create_elasticsearch_domain(
+    DomainName = domainName,
+    ElasticsearchVersion = '1.5',
+    ElasticsearchClusterConfig = ClusterConfig1,
+    EBSOptions = {
+        'EBSEnabled': True,
+        'VolumeType': 'gp2',
+        'VolumeSize': 300
+    },
+    AccessPolicies = """{
+    "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Principal": {
+            "AWS": "arn:aws:iam::336570842637:user/cche"
+          },
+          "Action": "es:*",
+          "Resource": "arn:aws:es:us-west-1:336570842637:domain/cche-es/*"
+        }
+      ]
+    }""",
+    SnapshotOptions = {
+        'AutomatedSnapshotStartHour': 0
+    },
+    AdvancedOptions = {
+        'indices.fielddata.cache.size': '40'
+    }
+)
+print("Create response ")
+pprint.pprint(response, width=1)
+
+
+# Update elasticsearch domain with Setting 1
+
+
+def updateWithConfig1():
+    response = client.update_elasticsearch_domain_config(
+        DomainName = domainName,
+        #ElasticsearchVersion = '1.5',
+        ElasticsearchClusterConfig = ClusterConfig1,
+        EBSOptions = {
+            'EBSEnabled': True,
+            'VolumeType': 'gp2',
+            'VolumeSize': 300
+        },
+        AccessPolicies = """{
+        "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": "arn:aws:iam::336570842637:user/cche"
+              },
+              "Action": "es:*",
+              "Resource": "arn:aws:es:us-west-1:336570842637:domain/cche-es/*"
+            }
+          ]
+        }""",
+        SnapshotOptions = {
+            'AutomatedSnapshotStartHour': 0
+        }
+    )
+    return response
+
+
+# Update elasticsearch domain with Setting 2
+
+
+def updateWithConfig2():
+    response = client.update_elasticsearch_domain_config(
+        DomainName = domainName,
+        #ElasticsearchVersion = '1.5',
+        ElasticsearchClusterConfig = ClusterConfig2,
+        EBSOptions = {
+            'EBSEnabled': True,
+            'VolumeType': 'gp2',
+            'VolumeSize': 300
+        },
+        AccessPolicies = """{
+        "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": "arn:aws:iam::336570842637:user/cche"
+              },
+              "Action": "es:*",
+              "Resource": "arn:aws:es:us-west-1:336570842637:domain/cche-es/*"
+            }
+          ]
+        }""",
+        SnapshotOptions = {
+            'AutomatedSnapshotStartHour': 0
+        }
+    )
+    return response
+
+
+# Periodic task to scale exlasticsearch cluster up and down
+
+continueExperiment = True
+
+def scheduler():
+    global continueExperiment
+    print("Time is now " + time.ctime())
+    describe_response = client.describe_elasticsearch_domain(
+        DomainName = domainName
+    )
+
+    if describe_response['DomainStatus']['Processing']:
+        print("Domain " + describe_response['DomainStatus']['DomainName'] + " is still processing.")
+    else:
+        if describe_response['DomainStatus']['ElasticsearchClusterConfig'] == ClusterConfig1:
+            updateWithConfig2()
+            print("Update to setting 2." )
+        else:
+            updateWithConfig1()
+            print("Update to setting 1.")
+
+    if continueExperiment:
+        threading.Timer(1800, scheduler).start()
+
+scheduler()
+
+# Periodic task to exercise elasticsearch
+
+es_host = 'search-cche-es-op72ovan54rin75ozyssphgu6i.us-west-1.es.amazonaws.com'
+
+from aws_requests_auth.aws_auth import AWSRequestsAuth
+from elasticsearch import Elasticsearch, RequestsHttpConnection
+
+auth = AWSRequestsAuth(aws_access_key='ACCESS_ID',
+                       aws_secret_access_key='ACCESS_KEY',
+                       aws_host='search-cche-es-op72ovan54rin75ozyssphgu6i.us-west-1.es.amazonaws.com',
+                       aws_region='us-west-1',
+                       aws_service='es')
+
+es_client = Elasticsearch(host=es_host,
+                          port=80,
+                          connection_class=RequestsHttpConnection,
+                          http_auth=auth)
+
+def request():
+    global continueExperiment
+    describe_response = client.describe_elasticsearch_domain(
+        DomainName=domainName
+    )
+    if describe_response['DomainStatus']['Processing'] == False:
+        print("domain ready")
+        for i in range(1, 1000):
+            indexresp = es_client.index(index="my-index", id=i, doc_type="test-type", body={"field1": "data=doc" + str(i)})
+            pprint.pprint(indexresp)
+        for i in range(1, 1000):
+            getresp = es_client.get(index="my-index", doc_type="test-type", id=i)['_source']
+            if (getresp['field1'] != "data=doc" + str(i)):
+                print("document not found")
+                pprint.pprint(getresp)
+                continueExperiment = False
+    else:
+        print("domain not ready")
+    if continueExperiment:
+        threading.Timer(60, request).start()
+
+request()
+
+
